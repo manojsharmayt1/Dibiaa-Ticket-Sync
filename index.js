@@ -5,11 +5,25 @@ const http = require("http");
 const PORT = process.env.PORT || 3000;
 
 http.createServer((req, res) => {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("Dibiaa Ticket Sync Bot is running");
-}).listen(PORT, "0.0.0.0", () => {
-    console.log(`HTTP server running on port ${PORT}`);
-});
+
+    res.writeHead(200, {
+        "Content-Type": "text/plain"
+    });
+
+    res.end(
+        "Dibiaa Ticket Sync Bot is running"
+    );
+
+}).listen(
+    PORT,
+    "0.0.0.0",
+    () => {
+        console.log(
+            `HTTP server running on port ${PORT}`
+        );
+    }
+);
+
 
 const {
     Client,
@@ -17,21 +31,47 @@ const {
     ComponentType
 } = require("discord.js");
 
+
 const client = new Client({
+
     intents: [
+
         GatewayIntentBits.Guilds,
+
         GatewayIntentBits.GuildMembers
+
     ]
+
 });
+
 
 const GOOGLE_SCRIPT_URL =
     process.env.GOOGLE_SCRIPT_URL;
 
+
 const POLL_INTERVAL = 3000;
 
-const processedClaims = new Set();
-const processedCloses = new Set();
-const processedUsers = new Set();
+
+// ==========================================
+// PROCESSED SETS
+// ==========================================
+
+const processedClaims =
+    new Set();
+
+const processedCloses =
+    new Set();
+
+const processedUsers =
+    new Set();
+
+
+// Numeric User ID sync
+let lastNumericUserSync = 0;
+
+const NUMERIC_USER_SYNC_INTERVAL =
+    30000;
+
 
 let scanning = false;
 
@@ -49,28 +89,38 @@ async function sendToGoogleSheets(data) {
             JSON.stringify(data)
         );
 
-        const response = await fetch(
-            GOOGLE_SCRIPT_URL,
-            {
-                method: "POST",
 
-                headers: {
-                    "Content-Type": "application/json"
-                },
+        const response =
+            await fetch(
+                GOOGLE_SCRIPT_URL,
+                {
 
-                body: JSON.stringify(data)
-            }
-        );
+                    method: "POST",
+
+                    headers: {
+                        "Content-Type":
+                            "application/json"
+                    },
+
+                    body:
+                        JSON.stringify(data)
+
+                }
+            );
+
 
         const text =
             await response.text();
+
 
         console.log(
             "Google Response:",
             text
         );
 
+
         return text;
+
 
     } catch (error) {
 
@@ -97,10 +147,14 @@ async function getUserName(
         return "";
     }
 
+
     try {
 
         const member =
-            await guild.members.fetch(userId);
+            await guild.members.fetch(
+                userId
+            );
+
 
         return (
             member.user.username ||
@@ -108,6 +162,7 @@ async function getUserName(
             member.displayName ||
             ""
         );
+
 
     } catch {
 
@@ -117,7 +172,196 @@ async function getUserName(
 
 
 // ==========================================
-// GET TICKET ID FROM CHANNEL
+// SYNC OLD NUMERIC USER IDs
+// ==========================================
+
+async function syncNumericUserIds(
+    guild
+) {
+
+    try {
+
+        console.log("");
+        console.log(
+            "================================="
+        );
+
+        console.log(
+            "CHECKING OLD NUMERIC USER IDS..."
+        );
+
+
+        const response =
+            await sendToGoogleSheets({
+
+                action:
+                    "get_numeric_users"
+
+            });
+
+
+        if (!response) {
+
+            console.log(
+                "No response from Google"
+            );
+
+            return;
+        }
+
+
+        let result;
+
+
+        try {
+
+            result =
+                JSON.parse(response);
+
+        } catch {
+
+            console.error(
+                "Invalid Google response"
+            );
+
+            return;
+        }
+
+
+        if (
+            !result.success ||
+            !Array.isArray(
+                result.users
+            )
+        ) {
+
+            console.log(
+                "No numeric users found"
+            );
+
+            return;
+        }
+
+
+        console.log(
+            "Numeric users found:",
+            result.users.length
+        );
+
+
+        for (
+            const row
+            of result.users
+        ) {
+
+            const ticketId =
+                String(
+                    row.ticket_id ||
+                    ""
+                ).trim();
+
+
+            const discordUserId =
+                String(
+                    row.user_id ||
+                    ""
+                ).trim();
+
+
+            if (
+                !ticketId ||
+                !discordUserId
+            ) {
+                continue;
+            }
+
+
+            // Get username from Discord
+            const username =
+                await getUserName(
+                    guild,
+                    discordUserId
+                );
+
+
+            if (!username) {
+
+                console.log(
+                    `Could not fetch username for ${discordUserId}`
+                );
+
+                continue;
+            }
+
+
+            console.log("");
+            console.log(
+                "OLD USER ID FOUND"
+            );
+
+            console.log(
+                "Ticket:",
+                ticketId
+            );
+
+            console.log(
+                "Discord ID:",
+                discordUserId
+            );
+
+            console.log(
+                "Username:",
+                username
+            );
+
+
+            // Replace numeric ID with username
+            await sendToGoogleSheets({
+
+                action:
+                    "update_user",
+
+                ticket_id:
+                    ticketId,
+
+                user_name:
+                    username
+
+            });
+
+
+            // Small delay so Google API isn't hammered
+            await new Promise(
+                resolve =>
+                    setTimeout(
+                        resolve,
+                        300
+                    )
+            );
+        }
+
+
+        console.log(
+            "OLD USER ID SYNC COMPLETE"
+        );
+
+        console.log(
+            "================================="
+        );
+
+
+    } catch (error) {
+
+        console.error(
+            "Numeric user sync error:",
+            error.message
+        );
+    }
+}
+
+
+// ==========================================
+// GET TICKET ID
 // ==========================================
 
 function getTicketIdFromChannel(
@@ -128,14 +372,17 @@ function getTicketIdFromChannel(
         return null;
     }
 
+
     const match =
         channel.name.match(
             /^ticket-(\d+)$/i
         );
 
+
     if (!match) {
         return null;
     }
+
 
     return match[1];
 }
@@ -157,6 +404,7 @@ function getField(
         return "";
     }
 
+
     const field =
         embed.fields.find(
             field => {
@@ -166,14 +414,18 @@ function getField(
                         field.name || ""
                     ).toLowerCase();
 
+
                 return name.includes(
                     fieldName.toLowerCase()
                 );
             }
         );
 
+
     return field
-        ? String(field.value || "")
+        ? String(
+            field.value || ""
+        )
         : "";
 }
 
@@ -188,10 +440,12 @@ function extractUserId(text) {
         return null;
     }
 
+
     const match =
         String(text).match(
             /<@!?(\d+)>/
         );
+
 
     return match
         ? match[1]
@@ -210,41 +464,43 @@ async function getTicketCreator(
 
     try {
 
-        /*
-         * Tickets Bot normally gives the ticket
-         * creator a USER-SPECIFIC permission overwrite.
-         *
-         * Staff roles are ROLE overwrites, so we ignore them.
-         */
-
         const overwrites =
-            channel.permissionOverwrites.cache;
+            channel
+                .permissionOverwrites
+                .cache;
+
 
         for (
             const [
                 id,
                 overwrite
-            ] of overwrites
+            ]
+            of overwrites
         ) {
 
-            // Only user-specific overwrite
+            // User-specific overwrite only
             if (
                 overwrite.type !== 1
             ) {
                 continue;
             }
 
-            // Ignore our own bot
+
+            // Ignore bot itself
             if (
                 id === client.user.id
             ) {
                 continue;
             }
 
+
             try {
 
                 const member =
-                    await guild.members.fetch(id);
+                    await guild.members.fetch(
+                        id
+                    );
+
 
                 // Ignore bots
                 if (
@@ -253,30 +509,33 @@ async function getTicketCreator(
                     continue;
                 }
 
-                /*
-                 * Return actual Discord username.
-                 *
-                 * Example:
-                 * it_dibiaa
-                 */
 
                 const username =
                     member.user.username;
+
 
                 if (!username) {
                     continue;
                 }
 
+
                 return {
-                    userId: member.id,
-                    username: username
+
+                    userId:
+                        member.id,
+
+                    username:
+                        username
+
                 };
+
 
             } catch {
 
                 continue;
             }
         }
+
 
     } catch (error) {
 
@@ -285,6 +544,7 @@ async function getTicketCreator(
             error.message
         );
     }
+
 
     return null;
 }
@@ -304,19 +564,20 @@ async function processTicketCreator(
             channel
         );
 
+
     if (!ticketId) {
         return;
     }
 
-    /*
-     * Already processed?
-     */
 
     if (
-        processedUsers.has(ticketId)
+        processedUsers.has(
+            ticketId
+        )
     ) {
         return;
     }
+
 
     const creator =
         await getTicketCreator(
@@ -324,19 +585,16 @@ async function processTicketCreator(
             guild
         );
 
-    /*
-     * Creator not found yet.
-     * Don't mark it as processed.
-     * Next 3-second scan will try again.
-     */
 
     if (!creator) {
         return;
     }
 
+
     processedUsers.add(
         ticketId
     );
+
 
     console.log("");
     console.log(
@@ -362,24 +620,17 @@ async function processTicketCreator(
     );
 
 
-    /*
-     * IMPORTANT:
-     *
-     * We intentionally send the username
-     * in user_id because you requested:
-     *
-     * User ID column = Discord username
-     */
-
     await sendToGoogleSheets({
 
-        action: "update_user",
+        action:
+            "update_user",
 
         ticket_id:
             ticketId,
 
         user_name:
             creator.username
+
     });
 }
 
@@ -415,6 +666,7 @@ function getTranscriptLink(
                             ""
                         ).toLowerCase();
 
+
                     if (
                         label.includes(
                             "view online transcript"
@@ -435,6 +687,7 @@ function getTranscriptLink(
             error.message
         );
     }
+
 
     return "";
 }
@@ -457,14 +710,17 @@ async function processClaim(
         return;
     }
 
+
     const ticketId =
         getTicketIdFromChannel(
             message.channel
         );
 
+
     if (!ticketId) {
         return;
     }
+
 
     const claimEmbed =
         message.embeds.find(
@@ -475,29 +731,37 @@ async function processClaim(
                         embed.title || ""
                     ).toLowerCase();
 
+
                 return title.includes(
                     "claimed ticket"
                 );
             }
         );
 
+
     if (!claimEmbed) {
         return;
     }
+
 
     processedClaims.add(
         message.id
     );
 
+
     const description =
-        claimEmbed.description || "";
+        claimEmbed.description ||
+        "";
+
 
     const claimedUserId =
         extractUserId(
             description
         );
 
+
     let claimedBy = "";
+
 
     if (claimedUserId) {
 
@@ -517,6 +781,7 @@ async function processClaim(
                 )
                 .trim();
     }
+
 
     console.log("");
     console.log(
@@ -549,13 +814,15 @@ async function processClaim(
 
     await sendToGoogleSheets({
 
-        action: "claim",
+        action:
+            "claim",
 
         ticket_id:
             ticketId,
 
         claimed_by:
             claimedBy
+
     });
 }
 
@@ -577,6 +844,7 @@ async function processClose(
         return;
     }
 
+
     const closeEmbed =
         message.embeds.find(
             embed => {
@@ -586,15 +854,18 @@ async function processClose(
                         embed.title || ""
                     ).toLowerCase();
 
+
                 return title.includes(
                     "ticket closed"
                 );
             }
         );
 
+
     if (!closeEmbed) {
         return;
     }
+
 
     const ticketId =
         getField(
@@ -602,9 +873,11 @@ async function processClose(
             "Ticket ID"
         ).trim();
 
+
     if (!ticketId) {
         return;
     }
+
 
     processedCloses.add(
         message.id
@@ -621,13 +894,16 @@ async function processClose(
             "Closed By"
         );
 
+
     const closedById =
         extractUserId(
             closedByText
         );
 
+
     let closedBy =
         closedByText;
+
 
     if (closedById) {
 
@@ -637,7 +913,9 @@ async function processClose(
                 closedById
             );
 
+
         if (discordName) {
+
             closedBy =
                 discordName;
         }
@@ -654,13 +932,16 @@ async function processClose(
             "Claimed By"
         );
 
+
     const claimedById =
         extractUserId(
             claimedByText
         );
 
+
     let claimedBy =
         claimedByText;
+
 
     if (claimedById) {
 
@@ -670,7 +951,9 @@ async function processClose(
                 claimedById
             );
 
+
         if (discordName) {
+
             claimedBy =
                 discordName;
         }
@@ -685,6 +968,7 @@ async function processClose(
         getTranscriptLink(
             message
         );
+
 
     if (!transcript) {
 
@@ -737,7 +1021,8 @@ async function processClose(
 
     await sendToGoogleSheets({
 
-        action: "close",
+        action:
+            "close",
 
         ticket_id:
             ticketId,
@@ -753,6 +1038,7 @@ async function processClose(
 
         transcript:
             transcript
+
     });
 }
 
@@ -768,10 +1054,14 @@ async function scanTranscriptChannel(
     const transcriptChannel =
         guild.channels.cache.find(
             channel =>
+
                 channel.isTextBased() &&
-                channel.name.toLowerCase() ===
+
+                channel.name
+                    .toLowerCase() ===
                 "transcript"
         );
+
 
     if (!transcriptChannel) {
 
@@ -782,12 +1072,15 @@ async function scanTranscriptChannel(
         return;
     }
 
+
     try {
 
         const messages =
-            await transcriptChannel.messages.fetch({
-                limit: 50
-            });
+            await transcriptChannel
+                .messages.fetch({
+                    limit: 50
+                });
+
 
         for (
             const message
@@ -799,6 +1092,7 @@ async function scanTranscriptChannel(
                 guild
             );
         }
+
 
     } catch (error) {
 
@@ -821,11 +1115,14 @@ async function scanTicketChannels(
     const ticketChannels =
         guild.channels.cache.filter(
             channel =>
+
                 channel.isTextBased() &&
+
                 /^ticket-\d+$/i.test(
                     channel.name
                 )
         );
+
 
     for (
         const channel
@@ -834,24 +1131,19 @@ async function scanTicketChannels(
 
         try {
 
-            // ==================================
-            // DETECT TICKET CREATOR
-            // ==================================
-
+            // Creator
             await processTicketCreator(
                 channel,
                 guild
             );
 
 
-            // ==================================
-            // GET TICKET MESSAGES
-            // ==================================
-
+            // Messages
             const messages =
                 await channel.messages.fetch({
                     limit: 30
                 });
+
 
             for (
                 const message
@@ -863,6 +1155,7 @@ async function scanTicketChannels(
                     guild
                 );
             }
+
 
         } catch (error) {
 
@@ -885,12 +1178,15 @@ async function scanEverything() {
         return;
     }
 
+
     scanning = true;
+
 
     try {
 
         const guild =
             client.guilds.cache.first();
+
 
         if (!guild) {
 
@@ -901,15 +1197,51 @@ async function scanEverything() {
             return;
         }
 
+
         await guild.channels.fetch();
+
+
+        // ==================================
+        // OLD NUMERIC USER ID SYNC
+        // ==================================
+
+        const now =
+            Date.now();
+
+
+        if (
+            now -
+            lastNumericUserSync >=
+            NUMERIC_USER_SYNC_INTERVAL
+        ) {
+
+            lastNumericUserSync =
+                now;
+
+
+            await syncNumericUserIds(
+                guild
+            );
+        }
+
+
+        // ==================================
+        // TRANSCRIPTS
+        // ==================================
 
         await scanTranscriptChannel(
             guild
         );
 
+
+        // ==================================
+        // ACTIVE TICKETS
+        // ==================================
+
         await scanTicketChannels(
             guild
         );
+
 
     } catch (error) {
 
@@ -917,6 +1249,7 @@ async function scanEverything() {
             "Scan error:",
             error
         );
+
 
     } finally {
 
@@ -955,10 +1288,16 @@ client.once(
         );
 
         console.log(
+            "Old numeric User ID sync: ENABLED"
+        );
+
+        console.log(
             "================================="
         );
 
+
         await scanEverything();
+
 
         setInterval(
             scanEverything,
