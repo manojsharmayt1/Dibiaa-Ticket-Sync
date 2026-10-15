@@ -1,29 +1,14 @@
+
 require("dotenv").config();
 
 const http = require("http");
 
 const PORT = process.env.PORT || 3000;
+const GOOGLE_SCRIPT_URL = process.env.GOOGLE_SCRIPT_URL;
+const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 
-http.createServer((req, res) => {
-
-    res.writeHead(200, {
-        "Content-Type": "text/plain"
-    });
-
-    res.end(
-        "Dibiaa Ticket Sync Bot is running"
-    );
-
-}).listen(
-    PORT,
-    "0.0.0.0",
-    () => {
-        console.log(
-            `HTTP server running on port ${PORT}`
-        );
-    }
-);
-
+const POLL_INTERVAL = 3000;
+const NUMERIC_USER_SYNC_INTERVAL = 30000;
 
 const {
     Client,
@@ -31,1302 +16,520 @@ const {
     ComponentType
 } = require("discord.js");
 
+// ---------------- HTTP HEALTH CHECK ----------------
 
-const client = new Client({
+http.createServer((req, res) => {
+    res.writeHead(200, {
+        "Content-Type": "application/json"
+    });
 
-    intents: [
-
-        GatewayIntentBits.Guilds,
-
-        GatewayIntentBits.GuildMembers
-
-    ]
-
+    res.end(JSON.stringify({
+        success: true,
+        service: "Dibiaa Ticket Sync Bot",
+        status: "running",
+        discordReady: client.isReady()
+    }));
+}).listen(PORT, "0.0.0.0", () => {
+    console.log(`HTTP server running on port ${PORT}`);
 });
 
+// ---------------- VALIDATE ENVIRONMENT ----------------
 
-const GOOGLE_SCRIPT_URL =
-    process.env.GOOGLE_SCRIPT_URL;
+if (!GOOGLE_SCRIPT_URL) {
+    console.error("Missing GOOGLE_SCRIPT_URL environment variable");
+}
 
+if (!DISCORD_BOT_TOKEN) {
+    console.error("Missing DISCORD_BOT_TOKEN environment variable");
+}
 
-const POLL_INTERVAL = 3000;
+// ---------------- DISCORD CLIENT ----------------
 
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMembers
+    ]
+});
 
-// ==========================================
-// PROCESSED SETS
-// ==========================================
+const processedClaims = new Set();
+const processedCloses = new Set();
+const processedUsers = new Set();
 
-const processedClaims =
-    new Set();
-
-const processedCloses =
-    new Set();
-
-const processedUsers =
-    new Set();
-
-
-// Numeric User ID sync
 let lastNumericUserSync = 0;
-
-const NUMERIC_USER_SYNC_INTERVAL =
-    30000;
-
-
 let scanning = false;
 
-
-// ==========================================
-// SEND DATA TO GOOGLE SHEETS
-// ==========================================
+// ---------------- GOOGLE SHEETS ----------------
 
 async function sendToGoogleSheets(data) {
+    if (!GOOGLE_SCRIPT_URL) {
+        console.error("Cannot send to Google: URL is missing");
+        return null;
+    }
 
     try {
+        console.log("Sending to Google:", JSON.stringify(data));
 
-        console.log(
-            "Sending to Google:",
-            JSON.stringify(data)
-        );
+        const response = await fetch(GOOGLE_SCRIPT_URL, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify(data),
+            signal: AbortSignal.timeout(20000)
+        });
 
+        const text = await response.text();
 
-        const response =
-            await fetch(
-                GOOGLE_SCRIPT_URL,
-                {
+        console.log("Google HTTP status:", response.status);
+        console.log("Google Response:", text);
 
-                    method: "POST",
-
-                    headers: {
-                        "Content-Type":
-                            "application/json"
-                    },
-
-                    body:
-                        JSON.stringify(data)
-
-                }
-            );
-
-
-        const text =
-            await response.text();
-
-
-        console.log(
-            "Google Response:",
-            text
-        );
-
+        if (!response.ok) {
+            console.error("Google HTTP request failed");
+            return null;
+        }
 
         return text;
-
-
     } catch (error) {
-
-        console.error(
-            "Google Sheets Error:",
-            error.message
-        );
-
+        console.error("Google Sheets Error:", error.message);
         return null;
     }
 }
 
+// ---------------- USERNAME LOOKUP ----------------
 
-// ==========================================
-// GET DISCORD USERNAME
-// ==========================================
-
-async function getUserName(
-    guild,
-    userId
-) {
-
-    if (!userId) {
-        return "";
-    }
-
+async function getUserName(guild, userId) {
+    if (!userId) return "";
 
     try {
+        const member = await guild.members.fetch(userId);
 
-        const member =
-            await guild.members.fetch(
-                userId
-            );
-
-
-        return (
-            member.user.username ||
+        return member.user.username ||
             member.user.globalName ||
             member.displayName ||
-            ""
+            "";
+    } catch (error) {
+        console.warn(
+            `Username lookup failed for ${userId}:`,
+            error.message
         );
-
-
-    } catch {
-
         return "";
     }
 }
 
+// ---------------- NUMERIC USER ID SYNC ----------------
 
-// ==========================================
-// SYNC OLD NUMERIC USER IDs
-// ==========================================
-
-async function syncNumericUserIds(
-    guild
-) {
-
+async function syncNumericUserIds(guild) {
     try {
+        console.log("Checking old numeric User IDs...");
 
-        console.log("");
-        console.log(
-            "================================="
-        );
+        const response = await sendToGoogleSheets({
+            action: "get_numeric_users"
+        });
 
-        console.log(
-            "CHECKING OLD NUMERIC USER IDS..."
-        );
-
-
-        const response =
-            await sendToGoogleSheets({
-
-                action:
-                    "get_numeric_users"
-
-            });
-
-
-        if (!response) {
-
-            console.log(
-                "No response from Google"
-            );
-
-            return;
-        }
-
+        if (!response) return;
 
         let result;
 
-
         try {
-
-            result =
-                JSON.parse(response);
-
+            result = JSON.parse(response);
         } catch {
-
-            console.error(
-                "Invalid Google response"
-            );
-
+            console.error("Invalid Google response for numeric users");
             return;
         }
 
-
-        if (
-            !result.success ||
-            !Array.isArray(
-                result.users
-            )
-        ) {
-
-            console.log(
-                "No numeric users found"
-            );
-
+        if (!result.success || !Array.isArray(result.users)) {
+            console.log("No numeric users returned");
             return;
         }
 
+        for (const row of result.users) {
+            const ticketId = String(row.ticket_id || "").trim();
+            const userId = String(row.user_id || "").trim();
 
-        console.log(
-            "Numeric users found:",
-            result.users.length
-        );
+            if (!ticketId || !userId) continue;
 
+            const username = await getUserName(guild, userId);
 
-        for (
-            const row
-            of result.users
-        ) {
+            if (!username) continue;
 
-            const ticketId =
-                String(
-                    row.ticket_id ||
-                    ""
-                ).trim();
-
-
-            const discordUserId =
-                String(
-                    row.user_id ||
-                    ""
-                ).trim();
-
-
-            if (
-                !ticketId ||
-                !discordUserId
-            ) {
-                continue;
-            }
-
-
-            // Get username from Discord
-            const username =
-                await getUserName(
-                    guild,
-                    discordUserId
-                );
-
-
-            if (!username) {
-
-                console.log(
-                    `Could not fetch username for ${discordUserId}`
-                );
-
-                continue;
-            }
-
-
-            console.log("");
-            console.log(
-                "OLD USER ID FOUND"
-            );
-
-            console.log(
-                "Ticket:",
-                ticketId
-            );
-
-            console.log(
-                "Discord ID:",
-                discordUserId
-            );
-
-            console.log(
-                "Username:",
-                username
-            );
-
-
-            // Replace numeric ID with username
             await sendToGoogleSheets({
-
-                action:
-                    "update_user",
-
-                ticket_id:
-                    ticketId,
-
-                user_name:
-                    username
-
+                action: "update_user",
+                ticket_id: ticketId,
+                user_name: username
             });
 
-
-            // Small delay so Google API isn't hammered
-            await new Promise(
-                resolve =>
-                    setTimeout(
-                        resolve,
-                        300
-                    )
-            );
+            await new Promise(resolve => setTimeout(resolve, 300));
         }
 
-
-        console.log(
-            "OLD USER ID SYNC COMPLETE"
-        );
-
-        console.log(
-            "================================="
-        );
-
-
+        console.log("Numeric User ID sync complete");
     } catch (error) {
-
-        console.error(
-            "Numeric user sync error:",
-            error.message
-        );
+        console.error("Numeric user sync error:", error.message);
     }
 }
 
+// ---------------- TICKET ID ----------------
 
-// ==========================================
-// GET TICKET ID
-// ==========================================
+function getTicketIdFromChannel(channel) {
+    if (!channel || !channel.name) return null;
 
-function getTicketIdFromChannel(
-    channel
-) {
-
-    if (!channel) {
-        return null;
-    }
-
-
-    const match =
-        channel.name.match(
-            /^ticket-(\d+)$/i
-        );
-
-
-    if (!match) {
-        return null;
-    }
-
-
-    return match[1];
+    const match = channel.name.match(/^ticket-(\d+)$/i);
+    return match ? match[1] : null;
 }
 
+// ---------------- EMBED FIELD ----------------
 
-// ==========================================
-// GET EMBED FIELD
-// ==========================================
+function getField(embed, fieldName) {
+    if (!embed || !embed.fields) return "";
 
-function getField(
-    embed,
-    fieldName
-) {
+    const target = fieldName.toLowerCase();
 
-    if (
-        !embed ||
-        !embed.fields
-    ) {
-        return "";
-    }
+    const field = embed.fields.find(item =>
+        String(item.name || "").toLowerCase().includes(target)
+    );
 
-
-    const field =
-        embed.fields.find(
-            field => {
-
-                const name =
-                    String(
-                        field.name || ""
-                    ).toLowerCase();
-
-
-                return name.includes(
-                    fieldName.toLowerCase()
-                );
-            }
-        );
-
-
-    return field
-        ? String(
-            field.value || ""
-        )
-        : "";
+    return field ? String(field.value || "").trim() : "";
 }
-
-
-// ==========================================
-// EXTRACT DISCORD USER ID
-// ==========================================
 
 function extractUserId(text) {
+    if (!text) return null;
 
-    if (!text) {
-        return null;
-    }
-
-
-    const match =
-        String(text).match(
-            /<@!?(\d+)>/
-        );
-
-
-    return match
-        ? match[1]
-        : null;
+    const match = String(text).match(/<@!?(\d+)>/);
+    return match ? match[1] : null;
 }
 
+// ---------------- FIND TICKET CREATOR ----------------
 
-// ==========================================
-// FIND TICKET CREATOR
-// ==========================================
-
-async function getTicketCreator(
-    channel,
-    guild
-) {
-
+async function getTicketCreator(channel, guild) {
     try {
+        const overwrites = channel.permissionOverwrites.cache;
 
-        const overwrites =
-            channel
-                .permissionOverwrites
-                .cache;
-
-
-        for (
-            const [
-                id,
-                overwrite
-            ]
-            of overwrites
-        ) {
-
-            // User-specific overwrite only
-            if (
-                overwrite.type !== 1
-            ) {
-                continue;
-            }
-
-
-            // Ignore bot itself
-            if (
-                id === client.user.id
-            ) {
-                continue;
-            }
-
+        for (const [id, overwrite] of overwrites) {
+            // Only user-specific permission overwrites.
+            if (overwrite.type !== 1) continue;
+            if (id === client.user.id) continue;
 
             try {
+                const member = await guild.members.fetch(id);
 
-                const member =
-                    await guild.members.fetch(
-                        id
-                    );
-
-
-                // Ignore bots
-                if (
-                    member.user.bot
-                ) {
-                    continue;
-                }
-
-
-                const username =
-                    member.user.username;
-
-
-                if (!username) {
-                    continue;
-                }
-
+                if (member.user.bot) continue;
 
                 return {
-
-                    userId:
-                        member.id,
-
-                    username:
-                        username
-
+                    userId: member.id,
+                    username: member.user.username
                 };
-
-
             } catch {
-
                 continue;
             }
         }
-
-
     } catch (error) {
-
         console.error(
-            "Ticket creator detection error:",
+            `Creator detection failed in ${channel.name}:`,
             error.message
         );
     }
-
 
     return null;
 }
 
+// ---------------- PROCESS TICKET CREATOR ----------------
 
-// ==========================================
-// PROCESS TICKET CREATOR
-// ==========================================
+async function processTicketCreator(channel, guild) {
+    const ticketId = getTicketIdFromChannel(channel);
 
-async function processTicketCreator(
-    channel,
-    guild
-) {
+    if (!ticketId || processedUsers.has(ticketId)) return;
 
-    const ticketId =
-        getTicketIdFromChannel(
-            channel
-        );
+    const creator = await getTicketCreator(channel, guild);
 
+    if (!creator) return;
 
-    if (!ticketId) {
-        return;
-    }
-
-
-    if (
-        processedUsers.has(
-            ticketId
-        )
-    ) {
-        return;
-    }
-
-
-    const creator =
-        await getTicketCreator(
-            channel,
-            guild
-        );
-
-
-    if (!creator) {
-        return;
-    }
-
-
-    processedUsers.add(
-        ticketId
-    );
-
-
-    console.log("");
-    console.log(
-        "================================="
-    );
-
-    console.log(
-        "TICKET CREATOR DETECTED"
-    );
-
-    console.log(
-        "Ticket:",
-        ticketId
-    );
-
-    console.log(
-        "Discord User:",
-        creator.username
-    );
-
-    console.log(
-        "================================="
-    );
-
-
-    await sendToGoogleSheets({
-
-        action:
-            "update_user",
-
-        ticket_id:
-            ticketId,
-
-        user_name:
-            creator.username
-
+    const response = await sendToGoogleSheets({
+        action: "update_user",
+        ticket_id: ticketId,
+        user_name: creator.username
     });
+
+    if (response) {
+        processedUsers.add(ticketId);
+        console.log(
+            `Ticket creator synced: ${ticketId} / ${creator.username}`
+        );
+    }
 }
 
+// ---------------- TRANSCRIPT LINK ----------------
 
-// ==========================================
-// GET TRANSCRIPT LINK
-// ==========================================
-
-function getTranscriptLink(
-    message
-) {
-
+function getTranscriptLink(message) {
     try {
+        for (const row of message.components || []) {
+            for (const component of row.components || []) {
+                if (component.type !== ComponentType.Button) continue;
 
-        for (
-            const row
-            of message.components || []
-        ) {
-
-            for (
-                const component
-                of row.components || []
-            ) {
+                const label = String(component.label || "").toLowerCase();
 
                 if (
-                    component.type ===
-                    ComponentType.Button
+                    label.includes("view online transcript") &&
+                    component.url
                 ) {
-
-                    const label =
-                        String(
-                            component.label ||
-                            ""
-                        ).toLowerCase();
-
-
-                    if (
-                        label.includes(
-                            "view online transcript"
-                        ) &&
-                        component.url
-                    ) {
-
-                        return component.url;
-                    }
+                    return component.url;
                 }
             }
         }
-
     } catch (error) {
-
-        console.log(
-            "Transcript button read error:",
-            error.message
-        );
+        console.warn("Transcript button read error:", error.message);
     }
-
 
     return "";
 }
 
+// ---------------- PROCESS CLAIM ----------------
 
-// ==========================================
-// PROCESS CLAIM
-// ==========================================
+async function processClaim(message, guild) {
+    if (processedClaims.has(message.id)) return;
 
-async function processClaim(
-    message,
-    guild
-) {
+    const ticketId = getTicketIdFromChannel(message.channel);
+    if (!ticketId) return;
 
-    if (
-        processedClaims.has(
-            message.id
-        )
-    ) {
-        return;
-    }
-
-
-    const ticketId =
-        getTicketIdFromChannel(
-            message.channel
-        );
-
-
-    if (!ticketId) {
-        return;
-    }
-
-
-    const claimEmbed =
-        message.embeds.find(
-            embed => {
-
-                const title =
-                    String(
-                        embed.title || ""
-                    ).toLowerCase();
-
-
-                return title.includes(
-                    "claimed ticket"
-                );
-            }
-        );
-
-
-    if (!claimEmbed) {
-        return;
-    }
-
-
-    processedClaims.add(
-        message.id
+    const claimEmbed = message.embeds.find(embed =>
+        String(embed.title || "").toLowerCase().includes("claimed ticket")
     );
 
+    if (!claimEmbed) return;
 
-    const description =
-        claimEmbed.description ||
-        "";
-
-
-    const claimedUserId =
-        extractUserId(
-            description
-        );
-
+    const description = claimEmbed.description || "";
+    const claimedUserId = extractUserId(description);
 
     let claimedBy = "";
 
-
     if (claimedUserId) {
-
-        claimedBy =
-            await getUserName(
-                guild,
-                claimedUserId
-            );
-
+        claimedBy = await getUserName(guild, claimedUserId);
     } else {
-
-        claimedBy =
-            description
-                .replace(
-                    /<@!?\d+>/g,
-                    ""
-                )
-                .trim();
+        claimedBy = description.replace(/<@!?\d+>/g, "").trim();
     }
 
+    if (!claimedBy) {
+        console.warn(`Claim detected but username missing for ticket ${ticketId}`);
+        return;
+    }
 
-    console.log("");
-    console.log(
-        "================================="
-    );
-
-    console.log(
-        "CLAIM DETECTED"
-    );
-
-    console.log(
-        "Ticket:",
-        ticketId
-    );
-
-    console.log(
-        "Claimed By:",
-        claimedBy
-    );
-
-    console.log(
-        "Message:",
-        message.id
-    );
-
-    console.log(
-        "================================="
-    );
-
-
-    await sendToGoogleSheets({
-
-        action:
-            "claim",
-
-        ticket_id:
-            ticketId,
-
-        claimed_by:
-            claimedBy
-
+    const response = await sendToGoogleSheets({
+        action: "claim",
+        ticket_id: ticketId,
+        claimed_by: claimedBy
     });
+
+    if (response) {
+        processedClaims.add(message.id);
+        console.log(`Claim synced: ticket ${ticketId}, by ${claimedBy}`);
+    }
 }
 
+// ---------------- PROCESS CLOSE ----------------
 
-// ==========================================
-// PROCESS CLOSE
-// ==========================================
+async function processClose(message, guild) {
+    if (processedCloses.has(message.id)) return;
 
-async function processClose(
-    message,
-    guild
-) {
+    const closeEmbed = message.embeds.find(embed =>
+        String(embed.title || "").toLowerCase().includes("ticket closed")
+    );
 
-    if (
-        processedCloses.has(
-            message.id
-        )
-    ) {
-        return;
-    }
+    if (!closeEmbed) return;
 
-
-    const closeEmbed =
-        message.embeds.find(
-            embed => {
-
-                const title =
-                    String(
-                        embed.title || ""
-                    ).toLowerCase();
-
-
-                return title.includes(
-                    "ticket closed"
-                );
-            }
-        );
-
-
-    if (!closeEmbed) {
-        return;
-    }
-
-
-    const ticketId =
-        getField(
-            closeEmbed,
-            "Ticket ID"
-        ).trim();
-
+    const ticketId = getField(closeEmbed, "Ticket ID");
 
     if (!ticketId) {
+        console.warn("Close embed found, but Ticket ID field is missing");
         return;
     }
 
+    const closedByText = getField(closeEmbed, "Closed By");
+    const claimedByText = getField(closeEmbed, "Claimed By");
 
-    processedCloses.add(
-        message.id
-    );
+    const closedById = extractUserId(closedByText);
+    const claimedById = extractUserId(claimedByText);
 
-
-    // ======================================
-    // CLOSED BY
-    // ======================================
-
-    const closedByText =
-        getField(
-            closeEmbed,
-            "Closed By"
-        );
-
-
-    const closedById =
-        extractUserId(
-            closedByText
-        );
-
-
-    let closedBy =
-        closedByText;
-
+    let closedBy = closedByText;
+    let claimedBy = claimedByText;
 
     if (closedById) {
-
-        const discordName =
-            await getUserName(
-                guild,
-                closedById
-            );
-
-
-        if (discordName) {
-
-            closedBy =
-                discordName;
-        }
+        closedBy = (await getUserName(guild, closedById)) || closedByText;
     }
-
-
-    // ======================================
-    // CLAIMED BY
-    // ======================================
-
-    const claimedByText =
-        getField(
-            closeEmbed,
-            "Claimed By"
-        );
-
-
-    const claimedById =
-        extractUserId(
-            claimedByText
-        );
-
-
-    let claimedBy =
-        claimedByText;
-
 
     if (claimedById) {
-
-        const discordName =
-            await getUserName(
-                guild,
-                claimedById
-            );
-
-
-        if (discordName) {
-
-            claimedBy =
-                discordName;
-        }
+        claimedBy = (await getUserName(guild, claimedById)) || claimedByText;
     }
 
+    let transcript = getTranscriptLink(message);
 
-    // ======================================
-    // TRANSCRIPT
-    // ======================================
+    // Fallback to the close message URL if there is no transcript button.
+    if (!transcript) transcript = message.url;
 
-    let transcript =
-        getTranscriptLink(
-            message
-        );
+    const closeTime = message.createdAt.toISOString();
 
-
-    if (!transcript) {
-
-        transcript =
-            message.url;
-    }
-
-
-    // ======================================
-    // CLOSE TIME
-    // ======================================
-
-    const closeTime =
-        message.createdAt.toISOString();
-
-
-    console.log("");
-    console.log(
-        "================================="
-    );
-
-    console.log(
-        "CLOSE DETECTED"
-    );
-
-    console.log(
-        "Ticket:",
-        ticketId
-    );
-
-    console.log(
-        "Closed By:",
-        closedBy
-    );
-
-    console.log(
-        "Claimed By:",
-        claimedBy
-    );
-
-    console.log(
-        "Transcript:",
-        transcript
-    );
-
-    console.log(
-        "================================="
-    );
-
-
-    await sendToGoogleSheets({
-
-        action:
-            "close",
-
-        ticket_id:
-            ticketId,
-
-        closed_by:
-            closedBy,
-
-        claimed_by:
-            claimedBy,
-
-        close_time:
-            closeTime,
-
-        transcript:
-            transcript
-
+    console.log("Close event detected:", {
+        ticketId,
+        closedBy,
+        claimedBy,
+        transcript,
+        closeTime
     });
+
+    const response = await sendToGoogleSheets({
+        action: "close",
+        ticket_id: ticketId,
+        closed_by: closedBy,
+        claimed_by: claimedBy,
+        close_time: closeTime,
+        transcript
+    });
+
+    if (response) {
+        try {
+            const result = JSON.parse(response);
+
+            if (result.success === false) {
+                console.error("Google rejected close update:", result.error);
+                return;
+            }
+        } catch {
+            console.warn("Google close response was not JSON");
+        }
+
+        processedCloses.add(message.id);
+        console.log(`Close event synced for ticket ${ticketId}`);
+    }
 }
 
+// ---------------- SCAN TRANSCRIPT CHANNEL ----------------
 
-// ==========================================
-// SCAN TRANSCRIPT CHANNEL
-// ==========================================
-
-async function scanTranscriptChannel(
-    guild
-) {
-
-    const transcriptChannel =
-        guild.channels.cache.find(
-            channel =>
-
-                channel.isTextBased() &&
-
-                channel.name
-                    .toLowerCase() ===
-                "transcript"
-        );
-
+async function scanTranscriptChannel(guild) {
+    const transcriptChannel = guild.channels.cache.find(channel =>
+        channel.isTextBased() &&
+        channel.name.toLowerCase() === "transcript"
+    );
 
     if (!transcriptChannel) {
-
-        console.log(
-            "Transcript channel not found"
-        );
-
+        console.warn("Transcript channel not found");
         return;
     }
 
-
     try {
+        const messages = await transcriptChannel.messages.fetch({
+            limit: 50
+        });
 
-        const messages =
-            await transcriptChannel
-                .messages.fetch({
-                    limit: 50
-                });
-
-
-        for (
-            const message
-            of messages.values()
-        ) {
-
-            await processClose(
-                message,
-                guild
-            );
+        for (const message of messages.values()) {
+            await processClose(message, guild);
         }
-
-
     } catch (error) {
-
         console.error(
-            "Transcript scan error:",
+            `Transcript scan error in #${transcriptChannel.name} ` +
+            `(channel ID ${transcriptChannel.id}):`,
+            `code=${error.code || "unknown"}`,
             error.message
         );
     }
 }
 
+// ---------------- SCAN ACTIVE TICKET CHANNELS ----------------
 
-// ==========================================
-// SCAN ACTIVE TICKET CHANNELS
-// ==========================================
+async function scanTicketChannels(guild) {
+    const ticketChannels = guild.channels.cache.filter(channel =>
+        channel.isTextBased() &&
+        /^ticket-\d+$/i.test(channel.name)
+    );
 
-async function scanTicketChannels(
-    guild
-) {
-
-    const ticketChannels =
-        guild.channels.cache.filter(
-            channel =>
-
-                channel.isTextBased() &&
-
-                /^ticket-\d+$/i.test(
-                    channel.name
-                )
-        );
-
-
-    for (
-        const channel
-        of ticketChannels.values()
-    ) {
-
+    for (const channel of ticketChannels.values()) {
         try {
+            await processTicketCreator(channel, guild);
 
-            // Creator
-            await processTicketCreator(
-                channel,
-                guild
-            );
+            const messages = await channel.messages.fetch({
+                limit: 30
+            });
 
+            for (const message of messages.values()) {
+                await processClaim(message, guild);
 
-            // Messages
-            const messages =
-                await channel.messages.fetch({
-                    limit: 30
-                });
-
-
-            for (
-                const message
-                of messages.values()
-            ) {
-
-                await processClaim(
-                    message,
-                    guild
-                );
+                // FIX: also check close embeds in ticket channels.
+                await processClose(message, guild);
             }
-
-
         } catch (error) {
-
             console.error(
-                `Ticket channel scan error (${channel.name}):`,
+                `Ticket channel scan error in #${channel.name} ` +
+                `(channel ID ${channel.id}):`,
+                `code=${error.code || "unknown"}`,
                 error.message
             );
         }
     }
 }
 
-
-// ==========================================
-// COMPLETE SCAN
-// ==========================================
+// ---------------- COMPLETE SCAN ----------------
 
 async function scanEverything() {
-
-    if (scanning) {
-        return;
-    }
-
+    if (scanning) return;
 
     scanning = true;
 
-
     try {
-
-        const guild =
-            client.guilds.cache.first();
-
+        const guild = client.guilds.cache.first();
 
         if (!guild) {
-
-            console.log(
-                "No Discord server found"
-            );
-
+            console.warn("No Discord server found");
             return;
         }
 
-
         await guild.channels.fetch();
 
+        const now = Date.now();
 
-        // ==================================
-        // OLD NUMERIC USER ID SYNC
-        // ==================================
-
-        const now =
-            Date.now();
-
-
-        if (
-            now -
-            lastNumericUserSync >=
-            NUMERIC_USER_SYNC_INTERVAL
-        ) {
-
-            lastNumericUserSync =
-                now;
-
-
-            await syncNumericUserIds(
-                guild
-            );
+        if (now - lastNumericUserSync >= NUMERIC_USER_SYNC_INTERVAL) {
+            lastNumericUserSync = now;
+            await syncNumericUserIds(guild);
         }
 
-
-        // ==================================
-        // TRANSCRIPTS
-        // ==================================
-
-        await scanTranscriptChannel(
-            guild
-        );
-
-
-        // ==================================
-        // ACTIVE TICKETS
-        // ==================================
-
-        await scanTicketChannels(
-            guild
-        );
-
-
+        await scanTranscriptChannel(guild);
+        await scanTicketChannels(guild);
     } catch (error) {
-
-        console.error(
-            "Scan error:",
-            error
-        );
-
-
+        console.error("Full scan error:", error);
     } finally {
-
         scanning = false;
     }
 }
 
+// ---------------- BOT READY ----------------
 
-// ==========================================
-// BOT READY
-// ==========================================
+client.once("clientReady", async () => {
+    console.log("=================================");
+    console.log(`Bot Online: ${client.user.tag}`);
+    console.log(`Servers: ${client.guilds.cache.size}`);
+    console.log("Dibiaa Ticket Sync READY");
+    console.log(`Polling every ${POLL_INTERVAL / 1000} seconds`);
+    console.log("=================================");
 
-client.once(
-    "clientReady",
-    async () => {
+    await scanEverything();
 
-        console.log("");
-        console.log(
-            "================================="
+    setInterval(() => {
+        scanEverything().catch(error =>
+            console.error("Scheduled scan failed:", error)
         );
+    }, POLL_INTERVAL);
+});
 
-        console.log(
-            `Bot Online: ${client.user.tag}`
-        );
+// ---------------- ERROR HANDLING ----------------
 
-        console.log(
-            `Servers: ${client.guilds.cache.size}`
-        );
+client.on("error", error => {
+    console.error("Discord Client Error:", error);
+});
 
-        console.log(
-            "Dibiaa Ticket Sync READY"
-        );
+process.on("unhandledRejection", error => {
+    console.error("Unhandled promise rejection:", error);
+});
 
-        console.log(
-            `Polling every ${POLL_INTERVAL / 1000} seconds`
-        );
+// ---------------- LOGIN ----------------
 
-        console.log(
-            "Old numeric User ID sync: ENABLED"
-        );
-
-        console.log(
-            "================================="
-        );
-
-
-        await scanEverything();
-
-
-        setInterval(
-            scanEverything,
-            POLL_INTERVAL
-        );
-    }
-);
-
-
-// ==========================================
-// ERROR HANDLING
-// ==========================================
-
-client.on(
-    "error",
-    error => {
-
-        console.error(
-            "Discord Client Error:",
-            error
-        );
-    }
-);
-
-
-// ==========================================
-// LOGIN
-// ==========================================
-
-client.login(
-    process.env.DISCORD_BOT_TOKEN
-);
+if (DISCORD_BOT_TOKEN) {
+    client.login(DISCORD_BOT_TOKEN).catch(error => {
+        console.error("Discord login failed:", error.message);
+    });
+}
