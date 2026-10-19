@@ -827,220 +827,100 @@ async function processClaim(
 }
 
 
-// ==========================================
-// PROCESS CLOSE
-// ==========================================
 
-async function processClose(
-    message,
-    guild
-) {
-
-    if (
-        processedCloses.has(
-            message.id
-        )
-    ) {
+async function processClose(message, guild) {
+    if (processedCloses.has(message.id)) {
         return;
     }
 
+    const closeEmbed = message.embeds.find(embed => {
+        const title = String(embed.title || "").toLowerCase();
+        return title.includes("ticket closed");
+    });
 
-    const closeEmbed =
-        message.embeds.find(
-            embed => {
+    if (!closeEmbed) return;
 
-                const title =
-                    String(
-                        embed.title || ""
-                    ).toLowerCase();
+    const ticketId = getField(closeEmbed, "Ticket ID").trim();
+    if (!ticketId) return;
 
+    processedCloses.add(message.id);
 
-                return title.includes(
-                    "ticket closed"
-                );
-            }
-        );
-
-
-    if (!closeEmbed) {
-        return;
-    }
-
-
-    const ticketId =
-        getField(
-            closeEmbed,
-            "Ticket ID"
-        ).trim();
-
-
-    if (!ticketId) {
-        return;
-    }
-
-
-    processedCloses.add(
-        message.id
-    );
-
-
-    // ======================================
     // CLOSED BY
-    // ======================================
-
-    const closedByText =
-        getField(
-            closeEmbed,
-            "Closed By"
-        );
-
-
-    const closedById =
-        extractUserId(
-            closedByText
-        );
-
-
-    let closedBy =
-        closedByText;
-
+    const closedByText = getField(closeEmbed, "Closed By");
+    const closedById = extractUserId(closedByText);
+    let closedBy = closedByText;
 
     if (closedById) {
-
-        const discordName =
-            await getUserName(
-                guild,
-                closedById
-            );
-
-
-        if (discordName) {
-
-            closedBy =
-                discordName;
-        }
+        const discordName = await getUserName(guild, closedById);
+        if (discordName) closedBy = discordName;
     }
 
-
-    // ======================================
     // CLAIMED BY
-    // ======================================
-
-    const claimedByText =
-        getField(
-            closeEmbed,
-            "Claimed By"
-        );
-
-
-    const claimedById =
-        extractUserId(
-            claimedByText
-        );
-
-
-    let claimedBy =
-        claimedByText;
-
+    const claimedByText = getField(closeEmbed, "Claimed By");
+    const claimedById = extractUserId(claimedByText);
+    let claimedBy = claimedByText;
 
     if (claimedById) {
+        const discordName = await getUserName(guild, claimedById);
+        if (discordName) claimedBy = discordName;
+    }
 
-        const discordName =
-            await getUserName(
-                guild,
-                claimedById
-            );
+    // CLOSE WITH REASON
+    let closeReason =
+        getField(closeEmbed, "Close Reason").trim();
 
+    if (!closeReason) {
+        closeReason = getField(closeEmbed, "Reason").trim();
+    }
 
-        if (discordName) {
+    // Embed description se reason nikalna
+    if (!closeReason && closeEmbed.description) {
+        const match = closeEmbed.description.match(
+            /(?:close\s*)?reason\s*:\s*([\s\S]+)/i
+        );
 
-            claimedBy =
-                discordName;
+        if (match) {
+            closeReason = match[1].trim();
         }
     }
 
-
-    // ======================================
-    // TRANSCRIPT
-    // ======================================
-
-    let transcript =
-        getTranscriptLink(
-            message
-        );
-
-
-    if (!transcript) {
-
-        transcript =
-            message.url;
+    // Empty/placeholder reason ko blank rakho
+    if (/^(none|n\/a|not provided|no reason)$/i.test(closeReason)) {
+        closeReason = "";
     }
 
+    // TRANSCRIPT LINK
+    let transcript = getTranscriptLink(message);
 
-    // ======================================
+    if (!transcript) {
+        transcript = message.url;
+    }
+
     // CLOSE TIME
-    // ======================================
+    const closeTime = message.createdAt.toISOString();
 
-    const closeTime =
-        message.createdAt.toISOString();
+    // LOGS
+    console.log("=================================");
+    console.log("CLOSE DETECTED");
+    console.log("Ticket:", ticketId);
+    console.log("Closed By:", closedBy);
+    console.log("Claimed By:", claimedBy);
+    console.log("Close Reason:", closeReason || "(reason not found)");
+    console.log("Transcript:", transcript);
+    console.log("=================================");
 
-
-    console.log("");
-    console.log(
-        "================================="
-    );
-
-    console.log(
-        "CLOSE DETECTED"
-    );
-
-    console.log(
-        "Ticket:",
-        ticketId
-    );
-
-    console.log(
-        "Closed By:",
-        closedBy
-    );
-
-    console.log(
-        "Claimed By:",
-        claimedBy
-    );
-
-    console.log(
-        "Transcript:",
-        transcript
-    );
-
-    console.log(
-        "================================="
-    );
-
-
+    // GOOGLE SHEETS
     await sendToGoogleSheets({
-
-        action:
-            "close",
-
-        ticket_id:
-            ticketId,
-
-        closed_by:
-            closedBy,
-
-        claimed_by:
-            claimedBy,
-
-        close_time:
-            closeTime,
-
-        transcript:
-            transcript
-
+        action: "close",
+        ticket_id: ticketId,
+        closed_by: closedBy,
+        claimed_by: claimedBy,
+        close_time: closeTime,
+        close_reason: closeReason,
+        transcript: transcript
     });
 }
+
 
 
 // ==========================================
